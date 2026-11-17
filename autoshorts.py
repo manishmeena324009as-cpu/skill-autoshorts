@@ -44,7 +44,7 @@ METRICS_FILE = LEARNINGS_FOLDER / "metrics.jsonl"
 RUNS_FOLDER = LEARNINGS_FOLDER / "runs"
 
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".m4v", ".webm"}
-GEMINI_MODEL = "gemini-3-flash-preview"
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
 UPLOAD_POST_BASE = "https://api.upload-post.com/api"
 
 
@@ -79,7 +79,7 @@ def sha256_of(path: Path) -> str:
 def load_state() -> dict:
     if not STATE_FILE.exists():
         return {"cycle_started_at": None, "processed": []}
-    state = json.loads(STATE_FILE.read_text())
+    state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
     state.setdefault("cycle_started_at", None)
     state.setdefault("processed", [])
     # Backfill schema: old records may only have processed_at, not last_processed_at.
@@ -95,7 +95,7 @@ def load_state() -> dict:
 
 def save_state(state: dict) -> None:
     STATE_FOLDER.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(state, indent=2, ensure_ascii=False))
+    STATE_FILE.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 def video_slug(video: Path) -> str:
@@ -245,7 +245,7 @@ def cmd_transcribe(args: argparse.Namespace) -> None:
         "segments": segments,
     }
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
+    out_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"[transcribe] {len(segments)} segments → {out_path}", file=sys.stderr)
     print(str(out_path))
 
@@ -306,12 +306,12 @@ def cmd_analyze(args: argparse.Namespace) -> None:
     if not transcript_path.exists():
         raise SystemExit(f"transcript not found: {transcript_path}")
 
-    transcript = transcript_path.read_text()
+    transcript = transcript_path.read_text(encoding="utf-8")
 
     # Inject prior learnings if HOT.md exists with content.
     priors_block = ""
     if HOT_FILE.exists():
-        hot = HOT_FILE.read_text().strip()
+        hot = HOT_FILE.read_text(encoding="utf-8").strip()
         if hot:
             priors_block = PRIORS_HEADER + hot + PRIORS_FOOTER
             print(f"[analyze] injecting {len(hot)} chars of priors from HOT.md", file=sys.stderr)
@@ -333,23 +333,38 @@ def cmd_analyze(args: argparse.Namespace) -> None:
     if uploaded.state.name != "ACTIVE":
         raise SystemExit(f"video upload failed: {uploaded.state.name}")
 
-    print(f"[analyze] calling {GEMINI_MODEL}…", file=sys.stderr)
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=[uploaded, prompt],
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-        ),
-    )
+    candidate_models = [GEMINI_MODEL, "gemini-3.5-flash", "gemini-3.7-flash", "gemini-3.1-flash-lite"]
+    # Deduplicate while preserving order
+    models_to_try = list(dict.fromkeys(candidate_models))
+    response = None
+    last_err = None
+    for model_name in models_to_try:
+        try:
+            print(f"[analyze] calling {model_name}…", file=sys.stderr)
+            response = client.models.generate_content(
+                model=model_name,
+                contents=[uploaded, prompt],
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                ),
+            )
+            break
+        except Exception as e:
+            print(f"[analyze] {model_name} failed: {e}. Trying fallback…", file=sys.stderr)
+            last_err = e
+            time.sleep(2)
+
+    if response is None:
+        raise SystemExit(f"All Gemini models failed: {last_err}")
 
     raw = response.text.strip()
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
-        out_path.with_suffix(".raw.txt").write_text(raw)
+        out_path.with_suffix(".raw.txt").write_text(raw, encoding="utf-8")
         raise SystemExit(f"Gemini returned non-JSON, dumped to {out_path.with_suffix('.raw.txt')}")
 
-    out_path.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+    out_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
     n = len(data.get("clips", []))
     print(f"[analyze] {n} clip candidates → {out_path}", file=sys.stderr)
 
@@ -397,7 +412,23 @@ def cmd_extract(args: argparse.Namespace) -> None:
 
 # ---------- hook overlay ----------
 
-DEFAULT_FONT = "/System/Library/Fonts/Supplemental/Impact.ttf"
+def _find_default_font() -> str:
+    candidates = [
+        os.getenv("AUTOSHORTS_FONT"),
+        r"C:\Windows\Fonts\impact.ttf",
+        r"C:\Windows\Fonts\arial.ttf",
+        "/System/Library/Fonts/Supplemental/Impact.ttf",
+        "/System/Library/Fonts/Impact.ttf",
+        "/usr/share/fonts/truetype/msttcorefonts/Impact.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    ]
+    for c in candidates:
+        if c and Path(c).exists():
+            return c
+    return r"C:\Windows\Fonts\arial.ttf" if os.name == "nt" else "/System/Library/Fonts/Supplemental/Impact.ttf"
+
+
+DEFAULT_FONT = _find_default_font()
 
 
 def render_hook_png(text: str, png_path: Path, video_w: int, font_path: str,
@@ -1020,7 +1051,7 @@ def cmd_reflect(args: argparse.Namespace) -> None:
     ]
     for o in data.get("observations", []):
         lines.append(f"- **{o.get('rule')}** — {o.get('evidence')}")
-    run_path.write_text("\n".join(lines) + "\n")
+    run_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(f"[reflect] {len(data.get('observations', []))} observations → {run_path}", file=sys.stderr)
     print(json.dumps(data, indent=2, ensure_ascii=False))
 
